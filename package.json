@@ -1,0 +1,8 @@
+{
+  "name": "flood-system",
+  "version": "1.0.0",
+  "description": "流域洪水预报与水库群联合调度系统",
+  "scripts": {
+    "dev": "powershell -NoProfile -Command \"Remove-Item -Path data\\flood.db -ErrorAction SilentlyContinue; python scripts\\init_db.py; Start-Process 'http://127.0.0.1:8071'; python -m uvicorn app.main:app --host 127.0.0.1 --port 8071\""
+  }
+}
