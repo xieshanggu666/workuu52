@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -6,6 +6,7 @@ from app.models import (EvacuationRecord, FloodZone, ForecastRun, ForecastSeries
                         RainStation, RainfallEvent, Reservoir, RiverNode,
                         RiverReach, SubBasin, WaterStation, WarningRecord)
 from app.services.forecast import run_forecast
+from app.services.idempotency import IdempotencyConflict
 
 router = APIRouter(prefix="/api")
 
@@ -87,36 +88,84 @@ def reservoirs(db: Session = Depends(get_db)):
 
 
 @router.get("/warnings")
-def warnings(db: Session = Depends(get_db)):
-    return [{"id": w.id, "target_type": w.target_type, "target_id": w.target_id,
+def warnings(db: Session = Depends(get_db),
+             scope: str = Query("active", description="active/all/superseded")):
+    """预警台账。默认只返回当前生效（active）记录，避免重复预报堆积；
+    scope=all 返回含 superseded 的完整历史（保留旧记录不删除）。"""
+    q = db.query(WarningRecord).order_by(WarningRecord.id.desc())
+    if scope == "active":
+        q = q.filter(WarningRecord.status == "active")
+    elif scope == "superseded":
+        q = q.filter(WarningRecord.status == "superseded")
+    return [{"id": w.id, "run_id": w.run_id, "target_type": w.target_type,
+             "target_id": w.target_id,
              "target_name": w.target_name, "level": w.level, "value": w.value,
              "threshold": w.threshold, "message": w.message,
              "created_at": w.created_at.isoformat() if w.created_at else None,
-             "status": w.status}
-            for w in db.query(WarningRecord).order_by(WarningRecord.id.desc()).all()]
+             "status": w.status,
+             "superseded_by_run_id": w.superseded_by_run_id}
+            for w in q.all()]
 
 
 @router.get("/evacuations")
-def evacuations(db: Session = Depends(get_db)):
-    return [{"id": e.id, "zone_id": e.zone_id, "zone_name": e.zone_name,
+def evacuations(db: Session = Depends(get_db), active_only: bool = True):
+    """转移行动记录。默认只返回进行中（pending/moving）的行动单：
+    重复预报会复用同区行动单而非新增；active_only=false 返回完整历史。"""
+    q = db.query(EvacuationRecord).order_by(EvacuationRecord.id.desc())
+    if active_only:
+        q = q.filter(EvacuationRecord.status.in_(["pending", "moving"]))
+    return [{"id": e.id, "run_id": e.run_id, "zone_id": e.zone_id,
+             "zone_name": e.zone_name,
              "triggered_by": e.triggered_by, "people": e.people, "status": e.status,
+             "linked_run_ids": list(e.linked_run_ids or []),
              "created_at": e.created_at.isoformat() if e.created_at else None}
-            for e in db.query(EvacuationRecord).order_by(EvacuationRecord.id.desc()).all()]
+            for e in q.all()]
 
 
 @router.post("/forecast/{eid}/{mode}")
-def forecast(eid: int, mode: str, db: Session = Depends(get_db)):
+def forecast(eid: int, mode: str, db: Session = Depends(get_db),
+             idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+             force: bool = Query(default=False, description="强制重新推演（忽略已完成运行）")):
+    """执行洪水预报。
+
+    幂等行为：
+    - 相同输入（情景/流域参数/引擎版本）重复提交 → 复用已完成运行，
+      响应中 ``idempotent_replay=true``，不新增预警与转移台账；
+    - 可携带 ``Idempotency-Key`` 请求头防止前端连点/网关重试导致的重复，
+      同键不同参数返回 409；
+    - ``force=true`` 显式强制重跑：旧运行置 superseded（历史保留），
+      不可与 Idempotency-Key 同时使用。
+    """
     event = db.query(RainfallEvent).get(eid)
     if not event:
-        return {"detail": "event not found"}
-    return run_forecast(db, event, reservoir_rule=mode)
+        raise HTTPException(status_code=404, detail="event not found")
+    try:
+        return run_forecast(db, event, reservoir_rule=mode,
+                            client_key=(idempotency_key or None), force=force)
+    except IdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.get("/forecast/runs")
 def forecast_runs(db: Session = Depends(get_db)):
     return [{"id": r.id, "event_id": r.event_id, "mode": r.mode,
-             "created_at": r.created_at.isoformat() if r.created_at else None}
+             "status": r.status,
+             "input_fingerprint": r.input_fingerprint,
+             "created_at": r.created_at.isoformat() if r.created_at else None,
+             "finished_at": r.finished_at.isoformat() if r.finished_at else None}
             for r in db.query(ForecastRun).order_by(ForecastRun.id.desc()).limit(20).all()]
+
+
+@router.get("/forecast/runs/{run_id}")
+def forecast_run_detail(run_id: int, db: Session = Depends(get_db)):
+    """按运行 ID 回放一次已完成预报（幂等复用的取结果入口）。"""
+    from app.services.forecast import replay_run
+    run = db.get(ForecastRun, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="forecast run not found")
+    if run.status != "done":
+        raise HTTPException(status_code=409, detail=f"forecast run is {run.status}")
+    return replay_run(db, run)
 
 
 @router.get("/forecast/series/{run_id}")

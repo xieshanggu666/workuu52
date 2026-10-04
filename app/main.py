@@ -7,9 +7,12 @@ from fastapi.responses import FileResponse
 from app.api.router import router
 from app.core.database import Base, engine
 from app.core.config import PORT
+from app.core.migrate import run_migrations
 
 # 启动时确保数据表存在（init_db.py 会调用 create_all，这里同样兜底）
 Base.metadata.create_all(bind=engine)
+# 为历史库增量补齐幂等列/索引（不删除任何历史预报与处置记录）
+run_migrations(engine)
 
 app = FastAPI(title="流域洪水预报与水库群联合调度系统")
 app.include_router(router)

@@ -2,13 +2,15 @@
 window.WarningsView = {
   name: "WarningsView",
   data() {
-    return { warnings: [], evacuations: [], zones: [], map: null, loading: false };
+    return { warnings: [], evacuations: [], zones: [], map: null, loading: false,
+             warnScope: "active", evacHistory: false };
   },
   computed: {
-    activeWarns() { return this.warnings.filter(w => w.status !== "cleared"); },
+    activeWarns() { return this.warnings.filter(w => w.status === "active"); },
     totals() {
       const t = { red: 0, orange: 0, yellow: 0, blue: 0 };
-      this.warnings.forEach(w => { if (t[w.level] !== undefined) t[w.level]++; });
+      // 统计口径始终为当前生效预警，重复预报产生的 superseded 记录不计入
+      this.activeWarns.forEach(w => { if (t[w.level] !== undefined) t[w.level]++; });
       return t;
     },
   },
@@ -16,10 +18,20 @@ window.WarningsView = {
     async load() {
       this.loading = true;
       try {
-        const [w, e, mp] = await Promise.all([API.warnings(), API.evacuations(), API.map()]);
+        const [w, e, mp] = await Promise.all([
+          API.warnings(this.warnScope),
+          API.evacuations(!this.evacHistory),
+          API.map()]);
         this.warnings = w; this.evacuations = e; this.map = mp;
         this.zones = mp.flood_zones;
       } finally { this.loading = false; }
+    },
+    async switchScope(scope) { this.warnScope = scope; await this.load(); },
+    async switchEvacHistory(on) { this.evacHistory = on; await this.load(); },
+    runTag(w) { return w.run_id ? `#${w.run_id}` : "历史"; },
+    linkedRuns(e) {
+              const ids = (e.linked_run_ids || []).filter(x => x != null);
+              return ids.length ? `关联 ${ids.length} 次预报` : "";
     },
     evacColor(st) {
       return { pending: "orange", moving: "blue", safe: "green" }[st] || "gray";
@@ -82,18 +94,27 @@ window.WarningsView = {
     <div class="row">
       <div class="col col-1">
         <div class="panel">
-          <div class="panel-head">预警记录 <span class="tag">{{ warnings.length }} 条</span></div>
+          <div class="panel-head">预警记录
+            <span class="tag">{{ activeWarns.length }} 条生效</span>
+            <span style="margin-left:auto;display:flex;gap:6px">
+              <button class="btn sm" :class="{primary: warnScope==='active'}" @click="switchScope('active')">当前生效</button>
+              <button class="btn sm" :class="{primary: warnScope==='all'}" @click="switchScope('all')">含历史(已替代)</button>
+            </span>
+          </div>
           <div class="panel-body nopad" style="max-height:480px;overflow-y:auto">
             <table class="grid">
-              <thead><tr><th>等级</th><th>目标</th><th>触发值</th><th>时间</th></tr></thead>
+              <thead><tr><th>等级</th><th>目标</th><th>触发值</th><th>来源运行</th><th>时间</th></tr></thead>
               <tbody>
-                <tr v-for="w in warnings" :key="w.id">
+                <tr v-for="w in warnings" :key="w.id" :style="w.status==='superseded' ? 'opacity:.5' : ''">
                   <td><span class="badge" :class="fmt.lvBadge(w.level)">{{ fmt.lvName(w.level) }}</span></td>
-                  <td>{{ w.target_name }}</td>
+                  <td>{{ w.target_name }}
+                    <span v-if="w.status==='superseded'" class="tag" style="margin-left:6px">已被 #{{ w.superseded_by_run_id }} 替代</span>
+                  </td>
                   <td class="num mono">{{ fmt.num(w.value,1) }} / {{ fmt.num(w.threshold,1) }}</td>
+                  <td style="font-size:11.5px;color:#7d95b4">{{ runTag(w) }}</td>
                   <td style="font-size:11.5px;color:#7d95b4">{{ fmt.time(w.created_at) }}</td>
                 </tr>
-                <tr v-if="!warnings.length"><td colspan="4" style="text-align:center;color:#7d95b4;padding:26px">暂无预警记录，执行洪水预报后自动生成</td></tr>
+                <tr v-if="!warnings.length"><td colspan="5" style="text-align:center;color:#7d95b4;padding:26px">暂无预警记录，执行洪水预报后自动生成</td></tr>
               </tbody>
             </table>
           </div>
@@ -102,19 +123,26 @@ window.WarningsView = {
 
       <div class="col col-1">
         <div class="panel">
-          <div class="panel-head">风险区转移台账 <span class="tag">{{ evacuations.length }} 次</span></div>
+          <div class="panel-head">风险区转移台账
+            <span class="tag">{{ evacuations.filter(e=>e.status!=='safe').length }} 处进行中</span>
+            <span style="margin-left:auto;display:flex;gap:6px">
+              <button class="btn sm" :class="{primary: !evacHistory}" @click="switchEvacHistory(false)">进行中</button>
+              <button class="btn sm" :class="{primary: evacHistory}" @click="switchEvacHistory(true)">全部历史</button>
+            </span>
+          </div>
           <div class="panel-body nopad">
             <table class="grid">
-              <thead><tr><th>风险区</th><th>触发方式</th><th>人数</th><th>状态</th><th>时间</th></tr></thead>
+              <thead><tr><th>风险区</th><th>触发方式</th><th>人数</th><th>状态</th><th>关联</th><th>时间</th></tr></thead>
               <tbody>
                 <tr v-for="e in evacuations" :key="e.id">
                   <td>{{ e.zone_name }}</td>
                   <td style="font-size:12px">{{ e.triggered_by }}</td>
                   <td class="num">{{ e.people }} 人</td>
                   <td><span class="badge" :class="evacColor(e.status)">{{ evacName(e.status) }}</span></td>
+                  <td style="font-size:11px;color:#7d95b4">{{ linkedRuns(e) }}</td>
                   <td style="font-size:11.5px;color:#7d95b4">{{ fmt.time(e.created_at) }}</td>
                 </tr>
-                <tr v-if="!evacuations.length"><td colspan="5" style="text-align:center;color:#7d95b4;padding:26px">无转移记录</td></tr>
+                <tr v-if="!evacuations.length"><td colspan="6" style="text-align:center;color:#7d95b4;padding:26px">无转移记录</td></tr>
               </tbody>
             </table>
           </div>

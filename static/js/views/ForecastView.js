@@ -6,6 +6,7 @@ window.ForecastView = {
       events: [], selected: null, eventDetail: null,
       mode: "natural",
       result: null, running: false,
+      forceRerun: false, replayNotice: "",
     };
   },
   computed: {
@@ -48,20 +49,29 @@ window.ForecastView = {
       if (!this.selected) return;
       this.eventDetail = await API.rainEvent(this.selected);
     },
-    async run() {
-      if (!this.selected) return;
+    async run(force = false) {
+      if (!this.selected || this.running) return;
       this.running = true;
-      window.app.showLoading("正在推演洪水预报过程…");
+      this.replayNotice = "";
+      window.app.showLoading(force ? "正在强制重新推演…" : "正在推演洪水预报过程…");
       try {
-        this.result = await API.forecast(this.selected, this.mode);
-        store.lastForecast = this.result;
-        if (this.result.run_id) {
-          const runs = await API.forecastRuns();
-          store.runs = runs;
+        // 前端再点同参数预报时后端直接幂等复用；force 由"强制重推"按钮触发
+        const res = await API.forecast(this.selected, this.mode, { force });
+        this.result = res;
+        store.lastForecast = res;
+        if (res.idempotent_replay) {
+          this.replayNotice =
+            `与历史预报 #${res.run_id} 输入一致，已直接复用其结果，未重复生成预警/转移台账`;
+          window.app.showToast("已复用历史预报结果（幂等）");
+        } else {
+          this.replayNotice = "";
         }
-        this.$emit("forecast-run", this.result);
+        const runs = await API.forecastRuns();
+        store.runs = runs;
+        this.$emit("forecast-run", res);
       } catch (e) {
-        window.app.toast("预报推演失败：" + e.message);
+        window.app.showToast(
+          e.status === 409 ? `请求冲突：${e.message}` : `预报推演失败：${e.message}`);
       } finally {
         window.app.hideLoading();
         this.running = false;
@@ -164,11 +174,19 @@ window.ForecastView = {
             <button v-for="c in scenarioCards()" :key="c.id" class="btn sm" :class="{primary: mode===c.id}" @click="mode = c.id" :disabled="running">{{ c.t }}</button>
           </div>
         </div>
-        <button class="btn primary" @click="run" :disabled="running || !selected">
+        <button class="btn primary" @click="run(false)" :disabled="running || !selected">
           {{ running ? '推演中…' : '▶ 开始洪水预报' }}
         </button>
+        <button class="btn" style="border-color:#f5b83d;color:#f5b83d"
+                title="忽略已完成运行，重新推演并生成最新台账（旧运行标记为已替代，历史保留）"
+                @click="run(true)" :disabled="running || !selected">↻ 强制重推</button>
         <span v-if="eventDetail" style="font-size:12px;color:#7d95b4">重现期 {{ eventDetail.return_period }} · {{ eventDetail.note }}</span>
       </div>
+    </div>
+
+    <!-- 幂等复用提示 -->
+    <div v-if="replayNotice" class="panel" style="margin-top:10px;padding:10px 16px;border-left:3px solid #2fd07f;background:rgba(47,208,127,.08);font-size:13px;color:#7bf0b3">
+      ✓ {{ replayNotice }}
     </div>
 
     <!-- 降雨 + 概览 -->

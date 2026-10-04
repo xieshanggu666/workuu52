@@ -18,6 +18,7 @@
   - `rule` 常规调度规则（非汛情期顺水控泄，强降雨峰前预泄腾库）
   - `optimized` 联合优化调度（倍率扫描 + 错峰错时微调，保证不劣于前两者）
 - **预警与转移**：站点水位分级预警（蓝/黄/橙/红）、淹没风险区评估、强制转移记录与转移路线可视化
+- **预报幂等**：预报运行与处置台账建立幂等关联——重复执行同一预报直接复用既有运行（过程线 + 预警 + 转移完整回放），不重复新增台账；支持 `Idempotency-Key` 请求头、`force` 强制重跑、并发触发收敛、异常安全重试与历史库自动迁移
 - **可视化前端**：SVG 流域河网拓扑图、实时监测、情景预报对比、闸门运行过程、削峰效果评估
 
 ## 技术栈
@@ -26,7 +27,7 @@
 | --- | --- |
 | 后端 | Python 3.10+ · FastAPI · SQLAlchemy 2 · SQLite |
 | 前端 | Vue 3（本地 UMD 全量构建）· 原生 SVG 图表 · 无构建链 |
-| 测试 | pytest（19 个用例：水文/水库/拓扑） |
+| 测试 | pytest（37 个用例：水文/水库/幂等/并发/迁移） |
 
 ## 目录结构
 
@@ -35,12 +36,13 @@ flood_system/
 ├── app/
 │   ├── main.py               # FastAPI 入口（静态托管 + 路由）
 │   ├── api/router.py         # 全部 REST 接口
-│   ├── core/                 # 配置 / 数据库
-│   ├── models/               # 12 张数据表（流域/河网/水库/站点/情景/预警…）
+│   ├── core/                 # 配置 / 数据库 / 轻量迁移（幂等列与索引）
+│   ├── models/               # 数据表（流域/河网/水库/站点/情景/预警/幂等索引…）
 │   └── services/
 │       ├── hydrology.py      # SCS-CN / 单位线 / 马斯京根 / 拓扑排序
 │       ├── reservoir.py      # 调洪演算 + 三工况联合调度
-│       └── forecast.py       # 预报编排 / 预警判定 / 转移联动
+│       ├── idempotency.py    # 输入指纹 / 指纹锁 / 心跳接管
+│       └── forecast.py       # 预报编排 / 幂等协调 / 台账关联 / 结果回放
 ├── static/                   # Vue 前端（无构建，直接托管）
 │   ├── index.html
 │   ├── css/style.css
@@ -88,7 +90,33 @@ python -m pytest tests -q
 | GET | `/api/map` | 河网拓扑 / 水库 / 风险区 |
 | GET | `/api/rain-events` | 降雨情景列表 |
 | GET | `/api/rain-events/{id}` | 情景雨量过程 |
-| POST | `/api/forecast/{event_id}/{mode}` | 执行洪水预报推演（natural / rule / optimized） |
-| GET | `/api/forecast-runs` | 历史预报记录 |
-| GET | `/api/warnings` | 预警台账 |
-| GET | `/api/evacuations` | 转移行动记录 |
+| POST | `/api/forecast/{event_id}/{mode}` | 执行（或幂等复用）洪水预报；支持 `Idempotency-Key` 头、`?force=true` |
+| GET | `/api/forecast/runs` | 历史预报记录（含 status / input_fingerprint） |
+| GET | `/api/forecast/runs/{run_id}` | 按运行 ID 回放已完成预报结果 |
+| GET | `/api/forecast/series/{run_id}` | 运行原始过程线 |
+| GET | `/api/warnings?scope=active\|all\|superseded` | 预警台账（默认仅生效；含历史已替代） |
+| GET | `/api/evacuations?active_only=true\|false` | 转移行动记录（默认仅进行中） |
+
+## 预报幂等设计
+
+「重复点击/定时重跑同一预报」过去会反复新增预警与转移台账。系统在预报运行
+（`forecast_runs`）与处置记录（`warning_records` / `evacuation_records`）之间
+建立了如下幂等关联：
+
+- **输入指纹**：对降雨情景、子流域/河网/水库/水位站/风险区参数与引擎版本
+  （`ENGINE_VERSION`）做规范化 SHA-256。相同指纹的重复请求直接回放已完成运行，
+  响应 `idempotent_replay=true`，**不再新增任何运行、过程线、预警、转移记录**。
+- **台账关联与历史保留**：预警/转移记录携带 `run_id`。新预报使同目标旧预警置为
+  `superseded`（记录 `superseded_by_run_id`，历史不删除，台账默认只见最新 active）；
+  同风险区进行中的转移行动被复用（`linked_run_ids` 追加），不重复建单。
+- **并发触发**：进程内按指纹串行锁收敛；跨进程由 `forecast_runs` 上的部分唯一索引
+  （running/done 各至多一条）仲裁，后来者轮询等待首个执行者并回放其结果。
+  SQLite 启用 WAL + busy_timeout。
+- **异常重试**：运行状态机 `running → done / failed`，带 owner 与心跳；
+  崩溃残留的 running（5 分钟无心跳）可被 CAS 接管；failed 不占唯一名额，可安全重试，
+  落库在单事务内完成（清理半成品 → 替代旧台账 → 写过程线/台账 → done）。
+- **显式幂等键**：请求头 `Idempotency-Key`（防前端连点/网关重试）；同键不同参数返回
+  `409 Conflict`。`POST ...?force=true` 可强制重跑（旧运行置 superseded，历史保留）。
+- **历史库迁移**：启动时 `app.core.migrate` 增量 `ALTER TABLE` 补列并
+  `CREATE INDEX IF NOT EXISTS`，不删数据；历史 `run_id=NULL` 记录与唯一索引共存
+  （SQLite 唯一索引中 NULL 互不冲突）。

@@ -15,9 +15,23 @@ const API = {
   rainEvents: () => API.get("/api/rain-events"),
   rainEvent: (id) => API.get(`/api/rain-events/${id}`),
   reservoirs: () => API.get("/api/reservoirs"),
-  warnings: () => API.get("/api/warnings"),
-  evacuations: () => API.get("/api/evacuations"),
-  forecast: (eid, mode) => API.post(`/api/forecast/${eid}/${mode}`),
+  warnings: (scope = "active") => API.get(`/api/warnings?scope=${scope}`),
+  evacuations: (activeOnly = true) => API.get(`/api/evacuations?active_only=${activeOnly}`),
+  forecast: (eid, mode, { force = false, idemKey = "" } = {}) => {
+    const qs = force ? "?force=true" : "";
+    const headers = {};
+    if (idemKey) headers["Idempotency-Key"] = idemKey;
+    return fetch(`/api/forecast/${eid}/${mode}${qs}`, { method: "POST", headers })
+      .then(async (r) => {
+        if (!r.ok) {
+          const body = await r.json().catch(() => ({}));
+          const err = new Error(body.detail || `HTTP ${r.status}`);
+          err.status = r.status;
+          throw err;
+        }
+        return r.json();
+      });
+  },
   forecastRuns: () => API.get("/api/forecast/runs"),
   forecastSeries: (runId) => API.get(`/api/forecast/series/${runId}`),
 };

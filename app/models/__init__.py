@@ -1,6 +1,7 @@
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import (Column, DateTime, Float, ForeignKey, Index, Integer, JSON,
+                        String, Text, text)
 
 from app.core.database import Base
 
@@ -149,7 +150,28 @@ class ForecastRun(Base):
     event_id = Column(Integer, nullable=False)
     mode = Column(String(24), default="natural")     # natural / rule / optimized
     created_at = Column(DateTime, default=datetime.now)
-    status = Column(String(24), default="done")
+    status = Column(String(24), default="done")      # running/done/failed
+    # 幂等：相同预报输入（情景/流域参数/引擎版本）的指纹一致，重复执行直接复用
+    input_fingerprint = Column(String(64), index=True)
+    client_key = Column(String(128), default="")     # 客户端显式幂等键（Idempotency-Key）
+    error = Column(String(300), default="")          # failed 时的错误摘要，便于异常重试排查
+    started_at = Column(DateTime, default=datetime.now)
+    finished_at = Column(DateTime)
+    heartbeat_at = Column(DateTime)                  # running 期间心跳，用于识别崩溃残留
+    owner = Column(String(80), default="")           # 执行实例标识（pid/线程），CAS 接管依据
+
+    __table_args__ = (
+        # 同一指纹：至多一个运行中（跨进程并发互斥的最终防线）
+        Index("uq_forecast_running_fp", "input_fingerprint", unique=True,
+              sqlite_where=text("status = 'running'")),
+        # 已完成运行：相同指纹至多一条（重复预报直接复用）；SQLite 部分唯一索引，
+        # running/failed 行不占唯一名额，因此异常后可重试生成新的运行
+        Index("uq_forecast_done_fp", "input_fingerprint", unique=True,
+              sqlite_where=text("status = 'done'")),
+        # 客户端显式幂等键全局唯一（仅对非空键生效）
+        Index("uq_forecast_client_key", "client_key", unique=True,
+              sqlite_where=text("client_key <> ''")),
+    )
 
 
 class ForecastSeries(Base):
@@ -189,6 +211,7 @@ class WarningRecord(Base):
     __tablename__ = "warning_records"
 
     id = Column(Integer, primary_key=True)
+    run_id = Column(Integer, ForeignKey("forecast_runs.id"), nullable=True, index=True)
     target_type = Column(String(24), default="station")   # station/reservoir/zone
     target_id = Column(Integer, default=0)
     target_name = Column(String(64), default="")
@@ -198,7 +221,14 @@ class WarningRecord(Base):
     threshold = Column(Float, default=0.0)
     message = Column(String(200), default="")
     created_at = Column(DateTime, default=datetime.now)
-    status = Column(String(16), default="active")         # active/cleared
+    status = Column(String(16), default="active")         # active/superseded/cleared
+    # 被哪次后续预报替代（历史记录保留，台账只展示最新 active）
+    superseded_by_run_id = Column(Integer, ForeignKey("forecast_runs.id"), nullable=True)
+
+    __table_args__ = (
+        # 数据库层兜底：一次运行对同一预警目标至多产生一条记录（并发/重试安全）
+        Index("uq_warning_run_target", "run_id", "target_type", "target_id", unique=True),
+    )
 
 
 class FloodZone(Base):
@@ -223,9 +253,19 @@ class EvacuationRecord(Base):
     __tablename__ = "evacuation_records"
 
     id = Column(Integer, primary_key=True)
+    run_id = Column(Integer, ForeignKey("forecast_runs.id"), nullable=True, index=True)
     zone_id = Column(Integer, nullable=False)
     zone_name = Column(String(64), default="")
     triggered_by = Column(String(64), default="")
     people = Column(Integer, default=0)
     status = Column(String(24), default="pending")        # pending/moving/safe
     created_at = Column(DateTime, default=datetime.now)
+    superseded_by_run_id = Column(Integer, ForeignKey("forecast_runs.id"), nullable=True)
+    # 新预报再次触发同一风险区转移时，复用进行中的转移行动而不是重复建单，
+    # 每次触发记入这一关联链（run_ids 按时间序）
+    linked_run_ids = Column(JSON, default=list)
+
+    __table_args__ = (
+        # 一次运行对同一风险区至多产生一条转移记录（数据库层幂等兜底）
+        Index("uq_evac_run_zone", "run_id", "zone_id", unique=True),
+    )
