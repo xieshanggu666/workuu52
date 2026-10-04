@@ -1,6 +1,7 @@
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import (Column, DateTime, Float, ForeignKey, Integer, JSON,
+                        String, Text, UniqueConstraint)
 
 from app.core.database import Base
 
@@ -142,19 +143,26 @@ class RainfallEvent(Base):
 
 
 class ForecastRun(Base):
-    """洪水预报运行"""
+    """洪水预报运行（同一情景×工况归并为同一次运行，重复触发幂等复用）"""
     __tablename__ = "forecast_runs"
+    __table_args__ = (
+        UniqueConstraint("event_id", "mode", name="uq_forecast_run_event_mode"),
+    )
 
     id = Column(Integer, primary_key=True)
     event_id = Column(Integer, nullable=False)
     mode = Column(String(24), default="natural")     # natural / rule / optimized
     created_at = Column(DateTime, default=datetime.now)
-    status = Column(String(24), default="done")
+    status = Column(String(24), default="running")   # running / done / failed
 
 
 class ForecastSeries(Base):
     """预报过程线（节点×变量×时段）"""
     __tablename__ = "forecast_series"
+    __table_args__ = (
+        UniqueConstraint("run_id", "node_id", "kind", "name",
+                         name="uq_series_run_node_kind"),
+    )
 
     id = Column(Integer, primary_key=True)
     run_id = Column(Integer, nullable=False)
@@ -185,10 +193,15 @@ class OperationPlan(Base):
 
 
 class WarningRecord(Base):
-    """预警记录"""
+    """预警记录（按 run_id+目标 幂等关联预报运行；run_id 为 NULL 的是历史遗留记录）"""
     __tablename__ = "warning_records"
+    __table_args__ = (
+        UniqueConstraint("run_id", "target_type", "target_id", "kind",
+                         name="uq_warning_run_target"),
+    )
 
     id = Column(Integer, primary_key=True)
+    run_id = Column(Integer, nullable=True)               # 关联预报运行；历史记录为 NULL
     target_type = Column(String(24), default="station")   # station/reservoir/zone
     target_id = Column(Integer, default=0)
     target_name = Column(String(64), default="")
@@ -219,10 +232,14 @@ class FloodZone(Base):
 
 
 class EvacuationRecord(Base):
-    """转移行动记录"""
+    """转移行动记录（按 run_id+风险区 幂等关联预报运行；run_id 为 NULL 的是历史遗留记录）"""
     __tablename__ = "evacuation_records"
+    __table_args__ = (
+        UniqueConstraint("run_id", "zone_id", name="uq_evacuation_run_zone"),
+    )
 
     id = Column(Integer, primary_key=True)
+    run_id = Column(Integer, nullable=True)           # 关联预报运行；历史记录为 NULL
     zone_id = Column(Integer, nullable=False)
     zone_name = Column(String(64), default="")
     triggered_by = Column(String(64), default="")

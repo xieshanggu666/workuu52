@@ -88,7 +88,8 @@ def reservoirs(db: Session = Depends(get_db)):
 
 @router.get("/warnings")
 def warnings(db: Session = Depends(get_db)):
-    return [{"id": w.id, "target_type": w.target_type, "target_id": w.target_id,
+    return [{"id": w.id, "run_id": w.run_id, "target_type": w.target_type,
+             "target_id": w.target_id,
              "target_name": w.target_name, "level": w.level, "value": w.value,
              "threshold": w.threshold, "message": w.message,
              "created_at": w.created_at.isoformat() if w.created_at else None,
@@ -98,7 +99,7 @@ def warnings(db: Session = Depends(get_db)):
 
 @router.get("/evacuations")
 def evacuations(db: Session = Depends(get_db)):
-    return [{"id": e.id, "zone_id": e.zone_id, "zone_name": e.zone_name,
+    return [{"id": e.id, "run_id": e.run_id, "zone_id": e.zone_id, "zone_name": e.zone_name,
              "triggered_by": e.triggered_by, "people": e.people, "status": e.status,
              "created_at": e.created_at.isoformat() if e.created_at else None}
             for e in db.query(EvacuationRecord).order_by(EvacuationRecord.id.desc()).all()]
@@ -114,7 +115,7 @@ def forecast(eid: int, mode: str, db: Session = Depends(get_db)):
 
 @router.get("/forecast/runs")
 def forecast_runs(db: Session = Depends(get_db)):
-    return [{"id": r.id, "event_id": r.event_id, "mode": r.mode,
+    return [{"id": r.id, "event_id": r.event_id, "mode": r.mode, "status": r.status,
              "created_at": r.created_at.isoformat() if r.created_at else None}
             for r in db.query(ForecastRun).order_by(ForecastRun.id.desc()).limit(20).all()]
 
